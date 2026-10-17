@@ -2,17 +2,17 @@ import type { Point } from "@tscircuit/math-utils"
 import type { GraphicsObject } from "graphics-debug"
 import { BaseSolver } from "lib/solvers/BaseSolver/BaseSolver"
 import type { NetLabelPlacement } from "lib/solvers/NetLabelPlacementSolver/NetLabelPlacementSolver"
-import type { SolvedTracePath } from "lib/solvers/SchematicTraceLinesSolver/SchematicTraceLinesSolver"
-import { visualizeInputProblem } from "lib/solvers/SchematicTracePipelineSolver/visualizeInputProblem"
-import { SingleOverlapSolver } from "lib/solvers/TraceLabelOverlapAvoidanceSolver/sub-solvers/SingleOverlapSolver/SingleOverlapSolver"
+import { segmentIntersectsRect } from "lib/solvers/NetLabelPlacementSolver/SingleNetLabelPlacementSolver/collisions"
 import {
   getCenterFromAnchor,
   getRectBounds,
 } from "lib/solvers/NetLabelPlacementSolver/SingleNetLabelPlacementSolver/geometry"
-import { segmentIntersectsRect } from "lib/solvers/NetLabelPlacementSolver/SingleNetLabelPlacementSolver/collisions"
-import { getColorFromString } from "lib/utils/getColorFromString"
-import type { InputProblem } from "lib/types/InputProblem"
+import type { SolvedTracePath } from "lib/solvers/SchematicTraceLinesSolver/SchematicTraceLinesSolver"
+import { visualizeInputProblem } from "lib/solvers/SchematicTracePipelineSolver/visualizeInputProblem"
 import type { CompletedTraceReroute } from "lib/solvers/TraceElbowTransitionSimplificationSolver/types"
+import { SingleOverlapSolver } from "lib/solvers/TraceLabelOverlapAvoidanceSolver/sub-solvers/SingleOverlapSolver/SingleOverlapSolver"
+import type { InputProblem } from "lib/types/InputProblem"
+import { getColorFromString } from "lib/utils/getColorFromString"
 
 const ON_PATH_EPS = 1e-6
 
@@ -258,6 +258,7 @@ export class NetLabelTraceCollisionSolver extends BaseSolver {
     })
 
     if (actionable.length === 0) {
+      this.snapSameNetLabelsClearOfParallelSegments()
       this.solved = true
       return
     }
@@ -296,12 +297,14 @@ export class NetLabelTraceCollisionSolver extends BaseSolver {
       detourCount,
       tracesToAvoidOverlapping: this.outputTraces,
       netLabelPlacements: this.outputNetLabelPlacements,
+      includeFallbackCandidates: true,
     })
   }
 
   /**
    * When a trace is rerouted, net labels that were anchored on the old path
-   * can be left floating in space. Snap their anchor back onto the new path.
+   * can be left floating in space or crossed by an expanded U-trace leg.
+   * Snap their anchor back onto the new path.
    */
   private reanchorLabelsOnMovedTrace(
     movedTrace: SolvedTracePath,
@@ -310,13 +313,82 @@ export class NetLabelTraceCollisionSolver extends BaseSolver {
     for (let i = 0; i < this.outputNetLabelPlacements.length; i++) {
       const label = this.outputNetLabelPlacements[i]!
       if (label.globalConnNetId !== movedTrace.globalConnNetId) continue
-      if (isPointOnPath(label.anchorPoint, movedTrace.tracePath)) continue
-      if (!isPointOnPath(label.anchorPoint, oldPath)) continue
 
-      const newAnchor = getClosestPointOnPath(
-        label.anchorPoint,
-        movedTrace.tracePath,
+      const onOldPath = isPointOnPath(label.anchorPoint, oldPath)
+      const onNewPath = isPointOnPath(label.anchorPoint, movedTrace.tracePath)
+      if (!onOldPath && !onNewPath) continue
+
+      const shrunkBounds = getRectBounds(
+        label.center,
+        Math.max(0, label.width - 1e-3),
+        Math.max(0, label.height - 1e-3),
       )
+      const oldPathCrossesLabelInterior = oldPath
+        .slice(1)
+        .some((end, idx) =>
+          segmentIntersectsRect(oldPath[idx]!, end, shrunkBounds),
+        )
+      const crossingSegIdx = movedTrace.tracePath
+        .slice(1)
+        .findIndex((end, idx) =>
+          segmentIntersectsRect(movedTrace.tracePath[idx]!, end, shrunkBounds),
+        )
+      const movedTraceCrossesLabelInterior =
+        crossingSegIdx !== -1 && !oldPathCrossesLabelInterior
+
+      if (onNewPath && !movedTraceCrossesLabelInterior) {
+        continue
+      }
+
+      const oldCornerIdx = oldPath.findIndex(
+        (p, idx) =>
+          idx > 0 &&
+          idx < oldPath.length - 1 &&
+          Math.hypot(p.x - label.anchorPoint.x, p.y - label.anchorPoint.y) <
+            ON_PATH_EPS,
+      )
+
+      let newAnchor: Point | null = null
+      if (
+        oldCornerIdx !== -1 &&
+        movedTrace.tracePath.length === oldPath.length
+      ) {
+        newAnchor = movedTrace.tracePath[oldCornerIdx]!
+      } else if (movedTraceCrossesLabelInterior) {
+        const segStart = movedTrace.tracePath[crossingSegIdx]!
+        const segEnd = movedTrace.tracePath[crossingSegIdx + 1]!
+        if (
+          (label.orientation === "x+" || label.orientation === "x-") &&
+          Math.abs(segStart.y - segEnd.y) < ON_PATH_EPS
+        ) {
+          newAnchor = {
+            x:
+              label.orientation === "x+"
+                ? Math.max(segStart.x, segEnd.x)
+                : Math.min(segStart.x, segEnd.x),
+            y: segStart.y,
+          }
+        } else if (
+          (label.orientation === "y+" || label.orientation === "y-") &&
+          Math.abs(segStart.x - segEnd.x) < ON_PATH_EPS
+        ) {
+          newAnchor = {
+            x: segStart.x,
+            y:
+              label.orientation === "y+"
+                ? Math.max(segStart.y, segEnd.y)
+                : Math.min(segStart.y, segEnd.y),
+          }
+        }
+      }
+
+      if (!newAnchor) {
+        newAnchor = getClosestPointOnPath(
+          label.anchorPoint,
+          movedTrace.tracePath,
+        )
+      }
+
       this.outputNetLabelPlacements[i] = {
         ...label,
         anchorPoint: newAnchor,
@@ -326,6 +398,71 @@ export class NetLabelTraceCollisionSolver extends BaseSolver {
           label.width,
           label.height,
         ),
+      }
+    }
+  }
+
+  private snapSameNetLabelsClearOfParallelSegments() {
+    for (let i = 0; i < this.outputNetLabelPlacements.length; i++) {
+      const label = this.outputNetLabelPlacements[i]!
+      if (label.orientation !== "x+" && label.orientation !== "x-") continue
+      const shrunkBounds = getRectBounds(
+        label.center,
+        Math.max(0, label.width - 1e-3),
+        Math.max(0, label.height - 1e-3),
+      )
+
+      let newAnchor: Point | null = null
+      for (const trace of this.outputTraces) {
+        if (trace.globalConnNetId !== label.globalConnNetId) continue
+        for (let segIdx = 0; segIdx < trace.tracePath.length - 1; segIdx++) {
+          const segStart = trace.tracePath[segIdx]!
+          const segEnd = trace.tracePath[segIdx + 1]!
+          if (!isPointOnPath(label.anchorPoint, [segStart, segEnd])) continue
+          if (!segmentIntersectsRect(segStart, segEnd, shrunkBounds)) continue
+
+          const minX = Math.min(segStart.x, segEnd.x)
+          const maxX = Math.max(segStart.x, segEnd.x)
+          if (
+            Math.abs(segStart.y - segEnd.y) < ON_PATH_EPS &&
+            label.anchorPoint.x > minX + ON_PATH_EPS &&
+            label.anchorPoint.x < maxX - ON_PATH_EPS
+          ) {
+            newAnchor = {
+              x: label.orientation === "x+" ? maxX : minX,
+              y: segStart.y,
+            }
+            break
+          }
+        }
+        if (newAnchor) break
+      }
+
+      if (!newAnchor) continue
+      const newCenter = getCenterFromAnchor(
+        newAnchor,
+        label.orientation,
+        label.width,
+        label.height,
+      )
+      const newShrunkBounds = getRectBounds(
+        newCenter,
+        Math.max(0, label.width - 1e-3),
+        Math.max(0, label.height - 1e-3),
+      )
+      const collidesWithAnyTrace = this.outputTraces.some((t) =>
+        t.tracePath
+          .slice(1)
+          .some((end, idx) =>
+            segmentIntersectsRect(t.tracePath[idx]!, end, newShrunkBounds),
+          ),
+      )
+      if (collidesWithAnyTrace) continue
+
+      this.outputNetLabelPlacements[i] = {
+        ...label,
+        anchorPoint: newAnchor,
+        center: newCenter,
       }
     }
   }

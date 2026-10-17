@@ -1,22 +1,30 @@
 import type { Point } from "@tscircuit/math-utils"
 import type { GraphicsObject } from "graphics-debug"
+import { tracePathCrossesAnyBounds } from "lib/solvers/AvailableNetOrientationSolver/geometry"
 import { BaseSolver } from "lib/solvers/BaseSolver/BaseSolver"
 import { countPathIntersections } from "lib/solvers/Example28Solver/geometry"
 import type { NetLabelPlacement } from "lib/solvers/NetLabelPlacementSolver/NetLabelPlacementSolver"
+import {
+  getCenterFromAnchor,
+  getRectBounds,
+} from "lib/solvers/NetLabelPlacementSolver/SingleNetLabelPlacementSolver/geometry"
+import {
+  rectsOverlap,
+  tracePathContainsPoint,
+} from "lib/solvers/RailNetLabelCornerPlacementSolver/geometry"
 import type { SolvedTracePath } from "lib/solvers/SchematicTraceLinesSolver/SchematicTraceLinesSolver"
 import { isPathCollidingWithObstacles } from "lib/solvers/SchematicTraceLinesSolver/SchematicTraceSingleLineSolver2/collisions"
 import { getObstacleRects } from "lib/solvers/SchematicTraceLinesSolver/SchematicTraceSingleLineSolver2/rect"
 import { visualizeInputProblem } from "lib/solvers/SchematicTracePipelineSolver/visualizeInputProblem"
 import { getInteriorShortcutPaths } from "lib/solvers/TraceCleanupSolver/getInteriorShortcutPaths"
 import { preservesLabelAnchors } from "lib/solvers/TraceCleanupSolver/sameNetRailAlignment/preservesLabelAnchors"
-import { tracePathContainsPoint } from "lib/solvers/RailNetLabelCornerPlacementSolver/geometry"
 import { simplifyPath } from "lib/solvers/TraceCleanupSolver/simplifyPath"
 import { detectTraceLabelOverlap } from "lib/solvers/TraceLabelOverlapAvoidanceSolver/detectTraceLabelOverlap"
 import type { InputProblem } from "lib/types/InputProblem"
 import { doesPathCoincideWithTraces } from "lib/utils/doesPathCoincideWithTraces"
-import type { CompletedTraceReroute } from "./types"
-import { generateElbowTransitionSimplificationCandidates } from "./generateElbowTransitionSimplificationCandidates"
 import { getSameNetJunctions } from "lib/utils/getSameNetJunctions"
+import { generateElbowTransitionSimplificationCandidates } from "./generateElbowTransitionSimplificationCandidates"
+import type { CompletedTraceReroute } from "./types"
 
 interface TraceElbowTransitionSimplificationSolverInput {
   inputProblem: InputProblem
@@ -173,6 +181,9 @@ export class TraceElbowTransitionSimplificationSolver extends BaseSolver {
         ({ label }) => `${label.globalConnNetId}:${label.netId}`,
       ),
     )
+    const sameNetLabels = this.input.netLabelPlacements.filter(
+      (label) => label.globalConnNetId === trace.globalConnNetId,
+    )
     const validCandidates = [...candidateByPath.values()].filter(
       (candidatePath) => {
         const candidateTrace = { ...trace, tracePath: candidatePath }
@@ -192,9 +203,59 @@ export class TraceElbowTransitionSimplificationSolver extends BaseSolver {
             initialPathLength + PATH_LENGTH_EPSILON &&
           candidatePath.length < tracePath.length
 
+        const cutsThroughSameNetLabelWithOccupiedCorner = sameNetLabels.some(
+          (label) => {
+            const bounds = getRectBounds(
+              label.center,
+              Math.max(0, label.width - 1e-3),
+              Math.max(0, label.height - 1e-3),
+            )
+            if (
+              !tracePathCrossesAnyBounds(candidatePath, bounds) ||
+              tracePathCrossesAnyBounds(tracePath, bounds)
+            ) {
+              return false
+            }
+            const corners = candidatePath.slice(1, -1)
+            const hasValidCorner = corners.some((corner) => {
+              const cornerCenter = getCenterFromAnchor(
+                corner,
+                label.orientation,
+                label.width,
+                label.height,
+              )
+              const cornerShrunkBounds = getRectBounds(
+                cornerCenter,
+                Math.max(0, label.width - 1e-3),
+                Math.max(0, label.height - 1e-3),
+              )
+              if (
+                tracePathCrossesAnyBounds(candidatePath, cornerShrunkBounds)
+              ) {
+                return false
+              }
+              const cornerBounds = getRectBounds(
+                cornerCenter,
+                label.width,
+                label.height,
+              )
+              return !this.input.netLabelPlacements.some(
+                (other) =>
+                  other !== label &&
+                  rectsOverlap(
+                    cornerBounds,
+                    getRectBounds(other.center, other.width, other.height),
+                  ),
+              )
+            })
+            return !hasValidCorner
+          },
+        )
+
         return (
           candidateOnlyKeepsExistingOverlaps &&
           (reducesCollisions || simplifiesGeometry) &&
+          !cutsThroughSameNetLabelWithOccupiedCorner &&
           preservesLabelAnchors(
             this.input.netLabelPlacements,
             [trace],

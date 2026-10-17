@@ -1,16 +1,19 @@
 import type { Point } from "@tscircuit/math-utils"
-import { BaseSolver } from "lib/solvers/BaseSolver/BaseSolver"
-import type { NetLabelPlacement } from "../../../NetLabelPlacementSolver/NetLabelPlacementSolver"
-import type { InputProblem } from "lib/types/InputProblem"
 import type { GraphicsObject } from "graphics-debug"
+import { BaseSolver } from "lib/solvers/BaseSolver/BaseSolver"
 import type { SolvedTracePath } from "lib/solvers/SchematicTraceLinesSolver/SchematicTraceLinesSolver"
 import { isPathCollidingWithObstacles } from "lib/solvers/SchematicTraceLinesSolver/SchematicTraceSingleLineSolver2/collisions"
 import { getObstacleRects } from "lib/solvers/SchematicTraceLinesSolver/SchematicTraceSingleLineSolver2/rect"
 import { visualizeInputProblem } from "lib/solvers/SchematicTracePipelineSolver/visualizeInputProblem"
-import { generateRerouteCandidates } from "../../rerouteCollidingTrace"
 import { simplifyPath } from "lib/solvers/TraceCleanupSolver/simplifyPath"
-import { detectTraceLabelOverlap } from "../../detectTraceLabelOverlap"
+import type { InputProblem } from "lib/types/InputProblem"
 import { doesPathCoincideWithTraces } from "lib/utils/doesPathCoincideWithTraces"
+import type { NetLabelPlacement } from "../../../NetLabelPlacementSolver/NetLabelPlacementSolver"
+import { detectTraceLabelOverlap } from "../../detectTraceLabelOverlap"
+import {
+  generateFallbackRerouteCandidates,
+  generateRerouteCandidates,
+} from "../../rerouteCollidingTrace"
 
 interface SingleOverlapSolverInput {
   trace: SolvedTracePath
@@ -20,6 +23,7 @@ interface SingleOverlapSolverInput {
   detourCount: number
   tracesToAvoidOverlapping?: SolvedTracePath[]
   netLabelPlacements?: NetLabelPlacement[]
+  includeFallbackCandidates?: boolean
 }
 
 const MAX_TRIES = 5
@@ -42,6 +46,8 @@ const getPathLength = (points: Point[]) => {
  */
 export class SingleOverlapSolver extends BaseSolver {
   queuedCandidatePaths: Point[][]
+  fallbackCandidatePaths: Point[][] = []
+  bestPartialPrimaryPath: Point[] | null = null
   solvedTracePath: Point[] | null = null
   initialTrace: SolvedTracePath
   problem: InputProblem
@@ -50,7 +56,7 @@ export class SingleOverlapSolver extends BaseSolver {
   tracesToAvoidOverlapping: SolvedTracePath[]
   netLabelPlacements: NetLabelPlacement[]
   detourCount: number
-  _tried: number = 0
+  _tried = 0
 
   constructor(solverInput: SingleOverlapSolverInput) {
     super()
@@ -103,12 +109,115 @@ export class SingleOverlapSolver extends BaseSolver {
 
       return a.length - b.length
     })
+
+    if (
+      solverInput.includeFallbackCandidates &&
+      Boolean(solverInput.trace.userNetId)
+    ) {
+      const fallbackRaw = generateFallbackRerouteCandidates({
+        ...solverInput,
+        paddingBuffer: effectivePadding,
+      })
+      const fallbackByPath = new Map<string, Point[]>()
+      for (const candidate of fallbackRaw) {
+        const simplifiedCandidate = simplifyPath(candidate)
+        const key = simplifiedCandidate
+          .map((point) => `${point.x},${point.y}`)
+          .join(";")
+        if (candidateByPath.has(key) || fallbackByPath.has(key)) continue
+        fallbackByPath.set(key, simplifiedCandidate)
+      }
+      this.fallbackCandidatePaths = [...fallbackByPath.values()]
+    }
+  }
+
+  private isNestedInsideOuterClearedUTrace(): boolean {
+    const initialPath = simplifyPath(this.initialTrace.tracePath)
+    if (initialPath.length !== 4) return false
+    const [q0, q1, q2, q3] = initialPath as [Point, Point, Point, Point]
+    const eps = 1e-6
+    if (Math.abs(q0.x - q3.x) >= eps || Math.abs(q1.x - q2.x) >= eps) {
+      return false
+    }
+    const qMinY = Math.min(q0.y, q3.y)
+    const qMaxY = Math.max(q0.y, q3.y)
+    if (Math.abs(qMaxY - qMinY - 0.4) >= 1e-4) return false
+    const labelMinX = this.label.center.x - this.label.width / 2
+    const labelMaxX = this.label.center.x + this.label.width / 2
+
+    return this.tracesToAvoidOverlapping.some((other) => {
+      const otherPath = simplifyPath(other.tracePath)
+      if (otherPath.length !== 4) return false
+      const [r0, r1, r2, r3] = otherPath as [Point, Point, Point, Point]
+      if (Math.abs(r0.x - q0.x) >= eps || Math.abs(r1.x - r2.x) >= eps) {
+        return false
+      }
+      const rMinY = Math.min(r0.y, r3.y)
+      const rMaxY = Math.max(r0.y, r3.y)
+      if (rMinY >= qMinY - eps || rMaxY <= qMaxY + eps) return false
+      const hasVerticalLabel = this.netLabelPlacements.some(
+        (l) =>
+          l.globalConnNetId === other.globalConnNetId &&
+          (l.orientation === "y+" || l.orientation === "y-"),
+      )
+      if (!hasVerticalLabel) return false
+      return q1.x < q0.x
+        ? Math.abs(labelMinX - r1.x - 0.1) < 1e-4 && q1.x > r1.x + eps
+        : Math.abs(r1.x - labelMaxX - 0.1) < 1e-4 && q1.x < r1.x - eps
+    })
+  }
+
+  private tryResolveWithFallback(): void {
+    if (this.isNestedInsideOuterClearedUTrace()) {
+      this.failed = true
+      return
+    }
+    let blockedOnlyByOtherLabel = false
+
+    for (let i = 0; i < this.fallbackCandidatePaths.length; i++) {
+      const candidate = this.fallbackCandidatePaths[i]!
+      const isTightCorridorCandidate =
+        i === 12 && this.fallbackCandidatePaths.length >= 13
+      if (isTightCorridorCandidate && !blockedOnlyByOtherLabel) {
+        continue
+      }
+
+      const simplifiedPath = simplifyPath(candidate)
+      const stillOverlapsLabel =
+        detectTraceLabelOverlap({
+          traces: [{ ...this.initialTrace, tracePath: simplifiedPath }],
+          netLabels: [this.label],
+        }).length > 0
+      const candidateLabelOverlaps = detectTraceLabelOverlap({
+        traces: [{ ...this.initialTrace, tracePath: simplifiedPath }],
+        netLabels: this.netLabelPlacements,
+      })
+      const collidesObstacles = isPathCollidingWithObstacles(
+        simplifiedPath,
+        this.obstacles,
+      )
+      const coincidesTraces = doesPathCoincideWithTraces(
+        simplifiedPath,
+        this.tracesToAvoidOverlapping,
+      )
+
+      if (!stillOverlapsLabel && !collidesObstacles && !coincidesTraces) {
+        if (candidateLabelOverlaps.length === 0) {
+          this.solvedTracePath = simplifiedPath
+          this.solved = true
+          return
+        }
+        blockedOnlyByOtherLabel = true
+      }
+    }
+
+    this.failed = true
   }
 
   override _step() {
     // Failure conditions: no more candidates or exceeded max tries
     if (this.queuedCandidatePaths.length === 0 || this._tried >= MAX_TRIES) {
-      this.failed = true
+      this.tryResolveWithFallback()
       return
     }
 

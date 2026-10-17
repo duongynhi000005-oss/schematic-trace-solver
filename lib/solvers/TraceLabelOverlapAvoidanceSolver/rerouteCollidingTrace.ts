@@ -1,12 +1,15 @@
 import type { Point } from "@tscircuit/math-utils"
-import type { SolvedTracePath } from "../SchematicTraceLinesSolver/SchematicTraceLinesSolver"
+import type { InputProblem } from "lib/types/InputProblem"
 import type { NetLabelPlacement } from "../NetLabelPlacementSolver/NetLabelPlacementSolver"
 import { getRectBounds } from "../NetLabelPlacementSolver/SingleNetLabelPlacementSolver/geometry"
-import type { InputProblem } from "lib/types/InputProblem"
-import { findTraceViolationZone } from "./violation"
-import { generateSnipAndReconnectCandidates } from "./trySnipAndReconnect"
-import { generateFourPointDetourCandidates } from "./tryFourPointDetour"
+import type { SolvedTracePath } from "../SchematicTraceLinesSolver/SchematicTraceLinesSolver"
 import { simplifyPath } from "../TraceCleanupSolver/simplifyPath"
+import { generateFourPointDetourCandidates } from "./tryFourPointDetour"
+import {
+  generateFallbackSnipAndReconnectCandidates,
+  generateSnipAndReconnectCandidates,
+} from "./trySnipAndReconnect"
+import { findTraceViolationZone } from "./violation"
 
 /**
  * Generates a list of candidate rerouted paths for a given trace that is
@@ -79,4 +82,55 @@ export const generateRerouteCandidates = ({
   })
 
   return [...fourPointCandidates, ...snipReconnectCandidates]
+}
+
+export const generateFallbackRerouteCandidates = ({
+  trace,
+  label,
+  paddingBuffer,
+  detourCount,
+}: {
+  trace: SolvedTracePath
+  label: NetLabelPlacement
+  problem: InputProblem
+  paddingBuffer: number
+  detourCount: number
+}): Point[][] => {
+  const initialTrace = { ...trace, tracePath: simplifyPath(trace.tracePath) }
+
+  if (trace.globalConnNetId === label.globalConnNetId) {
+    return []
+  }
+
+  const labelBoundsRaw = getRectBounds(label.center, label.width, label.height)
+  const labelBounds = {
+    minX: labelBoundsRaw.minX,
+    minY: labelBoundsRaw.minY,
+    maxX: labelBoundsRaw.maxX,
+    maxY: labelBoundsRaw.maxY,
+    chipId: `netlabel-${label.netId}`,
+  }
+
+  const effectivePadding = paddingBuffer + detourCount * paddingBuffer
+  const paddedLabelBounds = {
+    minX: labelBounds.minX - effectivePadding,
+    maxX: labelBounds.maxX + effectivePadding,
+    minY: labelBounds.minY - effectivePadding,
+    maxY: labelBounds.maxY + effectivePadding,
+  }
+
+  const { firstInsideIndex, lastInsideIndex } = findTraceViolationZone({
+    path: initialTrace.tracePath,
+    labelBounds,
+    paddedBounds: paddedLabelBounds,
+  })
+
+  return generateFallbackSnipAndReconnectCandidates({
+    initialTrace,
+    firstInsideIndex,
+    lastInsideIndex,
+    labelBounds,
+    paddingBuffer,
+    detourCount,
+  })
 }

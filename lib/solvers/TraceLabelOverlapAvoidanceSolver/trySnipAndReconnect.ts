@@ -97,3 +97,145 @@ export const generateSnipAndReconnectCandidates = ({
     ...pathFromExit,
   ])
 }
+
+export const generateFallbackSnipAndReconnectCandidates = ({
+  initialTrace,
+  labelBounds,
+  paddingBuffer,
+  detourCount,
+}: {
+  initialTrace: SolvedTracePath
+  firstInsideIndex: number
+  lastInsideIndex: number
+  labelBounds: any
+  paddingBuffer: number
+  detourCount: number
+}): Point[][] => {
+  const path = initialTrace.tracePath
+  if (path.length !== 4) {
+    return []
+  }
+
+  const [p0, p1, p2, p3] = path as [Point, Point, Point, Point]
+  const eps = 1e-6
+  const baseBuffer = paddingBuffer + detourCount * paddingBuffer
+  const candidates: Point[][] = []
+
+  const steps = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0.5]
+
+  // Vertical U-trace connecting two pins on the same vertical line (p0.x === p3.x)
+  if (
+    Math.abs(p0.x - p3.x) < eps &&
+    Math.abs(p1.x - p2.x) < eps &&
+    Math.abs(p0.y - p1.y) < eps &&
+    Math.abs(p2.y - p3.y) < eps
+  ) {
+    const dx = p1.x - p0.x
+    if (Math.abs(dx) > eps) {
+      const getOuterX = (step: number) =>
+        dx > 0
+          ? Math.max(p1.x, labelBounds.maxX + baseBuffer * step)
+          : Math.min(p1.x, labelBounds.minX - baseBuffer * step)
+
+      for (const step of steps) {
+        const outerX = getOuterX(step)
+        candidates.push([
+          p0,
+          { x: outerX, y: p0.y },
+          { x: outerX, y: p3.y },
+          p3,
+        ])
+      }
+
+      if (detourCount === 0 && Math.abs(dx) <= 0.1 + eps) {
+        const minPinY = Math.min(p0.y, p3.y)
+        const maxPinY = Math.max(p0.y, p3.y)
+        const altMinY = Math.min(minPinY, labelBounds.minY) - baseBuffer * 0.5
+        const altMaxY = Math.max(maxPinY, labelBounds.maxY) + baseBuffer * 0.5
+        const innerMinY = labelBounds.minY - baseBuffer * 0.5
+        const innerMaxY = labelBounds.maxY + baseBuffer * 0.5
+        const yPairs: Array<[number, number]> = [
+          [p0.y < p3.y ? innerMinY : p0.y, p3.y < p0.y ? innerMinY : p3.y],
+          [p0.y > p3.y ? innerMaxY : p0.y, p3.y > p0.y ? innerMaxY : p3.y],
+          [p0.y < p3.y ? altMinY : p0.y, p3.y < p0.y ? altMinY : p3.y],
+          [p0.y > p3.y ? altMaxY : p0.y, p3.y > p0.y ? altMaxY : p3.y],
+        ]
+        for (const [y0, y3] of yPairs) {
+          for (const step of steps) {
+            const outerX = getOuterX(step)
+            candidates.push([
+              p0,
+              p1,
+              { x: p1.x, y: y0 },
+              { x: outerX, y: y0 },
+              { x: outerX, y: y3 },
+              { x: p2.x, y: y3 },
+              p2,
+              p3,
+            ])
+          }
+        }
+      }
+    }
+    return candidates
+  }
+
+  // Horizontal U-trace connecting two pins on the same horizontal line (p0.y === p3.y)
+  if (
+    Math.abs(p0.y - p3.y) < eps &&
+    Math.abs(p1.y - p2.y) < eps &&
+    Math.abs(p0.x - p1.x) < eps &&
+    Math.abs(p2.x - p3.x) < eps
+  ) {
+    const dy = p1.y - p0.y
+    if (Math.abs(dy) > eps) {
+      const getOuterY = (step: number) =>
+        dy > 0
+          ? Math.max(p1.y, labelBounds.maxY + baseBuffer * step)
+          : Math.min(p1.y, labelBounds.minY - baseBuffer * step)
+
+      for (const step of steps) {
+        const outerY = getOuterY(step)
+        candidates.push([
+          p0,
+          { x: p0.x, y: outerY },
+          { x: p3.x, y: outerY },
+          p3,
+        ])
+      }
+
+      if (detourCount === 0 && Math.abs(dy) <= 0.1 + eps) {
+        const minPinX = Math.min(p0.x, p3.x)
+        const maxPinX = Math.max(p0.x, p3.x)
+        const altMinX = Math.min(minPinX, labelBounds.minX) - baseBuffer * 0.5
+        const altMaxX = Math.max(maxPinX, labelBounds.maxX) + baseBuffer * 0.5
+        const innerMinX = labelBounds.minX - baseBuffer * 0.5
+        const innerMaxX = labelBounds.maxX + baseBuffer * 0.5
+        const xPairs: Array<[number, number]> = [
+          [p0.x < p3.x ? innerMinX : p0.x, p3.x < p0.x ? innerMinX : p3.x],
+          [p0.x > p3.x ? innerMaxX : p0.x, p3.x > p0.x ? innerMaxX : p3.x],
+          [p0.x < p3.x ? altMinX : p0.x, p3.x < p0.x ? altMinX : p3.x],
+          [p0.x > p3.x ? altMaxX : p0.x, p3.x > p0.x ? altMaxX : p3.x],
+        ]
+        for (const [x0, x3] of xPairs) {
+          for (const step of steps) {
+            const outerY = getOuterY(step)
+            candidates.push([
+              p0,
+              p1,
+              { x: x0, y: p1.y },
+              { x: x0, y: outerY },
+              { x: x3, y: outerY },
+              { x: x3, y: p2.y },
+              p2,
+              p3,
+            ])
+          }
+        }
+      }
+    }
+    return candidates
+  }
+
+  return []
+}

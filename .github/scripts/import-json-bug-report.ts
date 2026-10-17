@@ -1,5 +1,9 @@
 import fs from "node:fs"
 import path from "node:path"
+import {
+  convertCircuitJsonToInputProblem,
+  isCircuitJsonArray,
+} from "../../lib/utils/convertCircuitJsonToInputProblem"
 
 type IssueEvent = {
   issue: {
@@ -71,13 +75,16 @@ async function main() {
   }
 
   const jsonAttachment = await getJsonAttachment(body)
-  assertInputProblem(jsonAttachment.value)
+  const normalizedProblem = isCircuitJsonArray(jsonAttachment.value)
+    ? convertCircuitJsonToInputProblem(jsonAttachment.value)
+    : jsonAttachment.value
+  assertInputProblem(normalizedProblem)
 
   fs.mkdirSync(reportDirAbs, { recursive: true })
   fs.mkdirSync(path.join(repoRoot, siteReportDir), { recursive: true })
   fs.writeFileSync(
     path.join(repoRoot, jsonPath),
-    `${JSON.stringify(jsonAttachment.value, null, 2)}\n`,
+    `${JSON.stringify(normalizedProblem, null, 2)}\n`,
   )
   fs.writeFileSync(path.join(repoRoot, testPath), getTestFile(reportId))
   fs.writeFileSync(path.join(repoRoot, pagePath), getPageFile(reportId))
